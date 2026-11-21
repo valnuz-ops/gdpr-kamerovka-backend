@@ -97,8 +97,11 @@ function doPost(e) {
     if (err) return json_({ ok: false, error: err });
     normalize_(data);
     if (!throttle_(String(data.kontakt.email).toLowerCase())) {
-      return json_({ ok: false, error: 'Příliš mnoho objednávek. Zkuste to prosím později nebo nám napište na ' + CONFIG.FROM_EMAIL + '.' });
+      return json_({ ok: false, error: 'Příliš mnoho objednávek. Zkuste to prosím později.' });
     }
+
+    const puvodni = najdiStandard_(data.spravce.ico);
+    if (puvodni) { data.aktualizaceZ = puvodni; data.tarif = 'standard'; }
 
     const id = 'GK' + Utilities.formatDate(new Date(), CONFIG.TZ, 'yyMMdd-HHmmss');
     const token = Utilities.getUuid();
@@ -120,7 +123,7 @@ function doPost(e) {
 
     notifyOwner_(id, token, data, a, folder.getUrl(), ohrozeniText);
     try { sendClientConfirmation_(id, data); } catch (x) { /* potvrzení není kritické */ }
-    return json_({ ok: true, id: id });
+    return json_({ ok: true, id: id, aktualizace: !!data.aktualizaceZ });
   } catch (x) {
     console.error(x);
     return json_({ ok: false, error: 'server' });
@@ -155,6 +158,10 @@ function approve_(id, token) {
       if (stav === 'odesláno') return page_('Dokumenty k objednávce ' + id + ' už byly odeslány.');
       if (stav === 'čeká na platbu') return page_('Faktura k objednávce ' + id + ' už byla odeslána, čeká se na platbu.');
       const data = JSON.parse(rows[i][14]);
+      if (data.aktualizaceZ) {
+        const n0 = deliverDocs_(sh, i + 1, rows[i], null);
+        return page_('Bezplatná aktualizace (Standard, původní objednávka ' + data.aktualizaceZ + '): ' + n0 + ' dokumentů odesláno na ' + data.kontakt.email + ', bez faktury.');
+      }
       if (!PropertiesService.getScriptProperties().getProperty('FAKTURAONLINE_API_KEY')) {
         const n = deliverDocs_(sh, i + 1, rows[i], null);
         return page_('Chybí FAKTURAONLINE_API_KEY – dokumenty (' + n + ') odeslány hned, fakturu vystavte ručně.');
@@ -330,7 +337,7 @@ function validate_(d) {
   if (!Array.isArray(d.kamery) || !d.kamery.length || d.kamery.length > 32) return 'Zadejte kamery.';
   if (d.kamery.some(function (k) { return !k || typeof k !== 'object' || !MISTA[k.misto]; })) return 'Neplatné údaje o kamerách.';
   if (!Array.isArray(d.incidenty) || !d.incidenty.length) return 'Uveďte alespoň jednu událost.';
-  if (d.provoz.zvuk) return 'Záznam zvuku nelze touto službou zdokumentovat. Napište nám prosím.';
+  if (d.provoz.zvuk) return 'Záznam zvuku nelze touto službou zdokumentovat. Pro objednávku je nutné záznam zvuku vypnout.';
   const dlouhe = d.kamery.some(function (k) { return k.rezim !== 'online' && Number(k.uchovani) > 72; });
   if (dlouhe && !String(d.provoz.duvodUchovani || '').trim()) return 'Odůvodněte dobu uchování delší než 72 hodin.';
   if (!d.souhlas) return 'Chybí souhlas s podmínkami.';
@@ -341,6 +348,7 @@ function normalize_(d) {
   const cut = function (s, n) { return String(s == null ? '' : s).slice(0, n); };
   d.spravce.typ = TERMINY[d.spravce.typ] ? d.spravce.typ : 'SVJ';
   d.tarif = CONFIG.TARIFY[d.tarif] ? d.tarif : 'zaklad';
+  delete d.aktualizaceZ; // nastavuje jen server (najdiStandard_)
   d.kamery.forEach(function (k) {
     k.popis = cut(k.popis, 120);
     k.rezim = k.rezim === 'online' ? 'online' : 'zaznam';
@@ -812,6 +820,27 @@ function docOznameni_(ctx) {
   return wrap_('Oznámení o kamerovém systému v domě', h, ctx);
 }
 
+// Zaplacená objednávka Standard se stejným IČO, dodaná před méně než 12 měsíci a s méně než 2 aktualizacemi → vrátí její ID
+function najdiStandard_(ico) {
+  const rows = sheet_().getDataRange().getValues();
+  const rok = 365 * 24 * 3600 * 1000;
+  let nalez = '';
+  for (let i = 1; i < rows.length; i++) {
+    if (String(rows[i][4]).replace(/\D/g, '') !== String(ico) || rows[i][COL.STAV - 1] !== 'odesláno') continue;
+    let dd; try { dd = JSON.parse(rows[i][14]); } catch (x) { continue; }
+    if (dd.tarif !== 'standard' || dd.aktualizaceZ || !rows[i][COL.ZAPLACENO - 1]) continue;
+    const kdy = rows[i][COL.ODESLANO - 1];
+    if (!(kdy instanceof Date) || Date.now() - kdy.getTime() > rok) continue;
+    nalez = rows[i][1];
+  }
+  if (!nalez) return '';
+  let pocet = 0;
+  for (let j = 1; j < rows.length; j++) {
+    try { if (JSON.parse(rows[j][14]).aktualizaceZ === nalez) pocet++; } catch (x) { /* */ }
+  }
+  return pocet < 2 ? nalez : '';
+}
+
 function cena_(d) { return (CONFIG.TARIFY[d && d.tarif] || CONFIG.TARIFY.zaklad).cena; }
 function tarifNazev_(d) { return (CONFIG.TARIFY[d && d.tarif] || CONFIG.TARIFY.zaklad).nazev; }
 
@@ -847,6 +876,12 @@ function notifyOwner_(id, token, d, a, folderUrl, ohrozeniText) {
   if (a.varovani.length) html += '<p style="color:#a00"><b>Upozornění:</b><br>' + a.varovani.map(function (v) { return esc(v); }).join('<br>') + '</p>';
   if (ohrozeniText) html += '<p><b>Text od Claude (zkontrolujte v balančním testu):</b><br>' + esc(ohrozeniText) + '</p>';
   html += '<p>1) Zkontrolujte a případně upravte dokumenty: <a href="' + folderUrl + '">složka v Drive</a></p>';
+  if (d.aktualizaceZ) {
+    html += '<p><b>Bezplatná aktualizace</b> k objednávce ' + esc(d.aktualizaceZ) + ' (Standard, do 12 měsíců).</p>';
+    html += '<p>2) <a href="' + url + '" style="background:#0a7;color:#fff;padding:8px 14px;text-decoration:none;border-radius:4px">Schválit a poslat dokumenty</a> – bez faktury.</p>';
+    MailApp.sendEmail({ to: CONFIG.OWNER_EMAIL, subject: 'GDPR kamery – aktualizace ' + id + ' – ' + d.spravce.nazev, htmlBody: html });
+    return;
+  }
   html += '<p>2) <a href="' + url + '" style="background:#0a7;color:#fff;padding:8px 14px;text-decoration:none;border-radius:4px">Schválit a poslat fakturu</a> – vystaví fakturu ' + cena_(d) +
     ' Kč ve FakturaOnline a pošle ji klientovi. Dokumenty odejdou automaticky po zaplacení (označte fakturu jako zaplacenou ve FakturaOnline).</p>';
   html += '<p style="font-size:13px;color:#555">Platba hotově nebo výjimka: <a href="' + url.replace('?a=approve', '?a=send') + '">odeslat dokumenty hned</a>.</p>';
@@ -854,6 +889,12 @@ function notifyOwner_(id, token, d, a, folderUrl, ohrozeniText) {
 }
 
 function sendClientConfirmation_(id, d) {
+  if (d.aktualizaceZ) {
+    sendAsBrand_(d.kontakt.email, 'Přijali jsme aktualizaci dokumentace ' + id,
+      '<p>Dobrý den,</p><p>děkujeme, přijali jsme aktualizaci dokumentace ke kamerovému systému (' + id + '). V rámci tarifu Standard je zdarma – ' +
+      'nové dokumenty Vám pošleme e-mailem do 1 pracovního dne, bez faktury.</p><p>S pozdravem<br>' + CONFIG.BRAND + '<br>' + CONFIG.SITE_URL + '</p>', null);
+    return;
+  }
   const html = '<p>Dobrý den,</p><p>děkujeme za objednávku <b>' + id + '</b> – ' + CONFIG.SERVICE_NAME + '.</p>' +
     '<p>Dokumenty jsme připravili podle Vašich údajů. Nyní zkontrolujeme jejich úplnost a soulad s Vašimi údaji a do 1 pracovního dne Vám pošleme fakturu (' +
     cena_(d) + ' Kč, tarif ' + tarifNazev_(d) + ', nejsme plátci DPH). Po jejím zaplacení Vám dokumenty automaticky odešleme v PDF a Wordu.</p>' +
@@ -880,7 +921,7 @@ function sendClientDocs_(id, d, attachments, names, zaplaceno) {
     '<li>Informaci o zpracování vyvěste na nástěnku v domě' + (d.web ? ' a na web ' + esc(d.web) : '') + '.</li>' +
     '<li>Evidenci přístupů veďte při každém prohlížení nebo předání záznamu.</li>' +
     (d.tarif === 'standard' ? '<li>Pozvánku a podklad rozešlete s programem shromáždění, oznámení vyvěste na nástěnku.</li>' : '') +
-    '<li>Při změně kamer dokumentaci aktualizujte – stačí nám napsat' + (d.tarif === 'standard' ? ' (v tarifu Standard 12 měsíců zdarma)' : '') + '.</li></ol>' +
+    '<li>Při změně kamer dokumentaci aktualizujte – vyplňte dotazník na ' + CONFIG.SITE_URL + ' znovu se stejným IČO' + (d.tarif === 'standard' ? ' (v tarifu Standard do 12 měsíců zdarma, nejvýše dvakrát)' : '') + '.</li></ol>' +
     (zaplaceno ? '<p>Děkujeme za úhradu faktury.</p>' : '') +
     '<p>Dokumenty vycházejí z Metodiky ÚOOÚ a z Vašich údajů; nejde o právní službu.</p>' +
     '<p>Potřebujete kamery nainstalovat, rozšířit nebo opravit? Rádi pomůžeme – <a href="https://kamerovka.cz">kamerovka.cz</a>.</p>' +
