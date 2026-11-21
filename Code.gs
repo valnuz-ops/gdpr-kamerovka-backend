@@ -12,7 +12,7 @@
 
 // ===================== NASTAVENÍ =====================
 const CONFIG = {
-  OWNER_EMAIL: 'bilanextllc@gmail.com',      // kam chodí objednávky ke kontrole
+  OWNER_EMAIL: 'info@kamerovka.cz',         // kam chodí objednávky a platby
   FROM_EMAIL: 'info@kamerovka.cz',           // odesílatel e-mailů klientům (alias v Gmailu)
   BRAND: 'Kamerovka.cz',
   SERVICE_NAME: 'GDPR dokumentace ke kamerovému systému',
