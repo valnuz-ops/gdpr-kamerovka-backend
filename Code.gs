@@ -24,7 +24,10 @@ const CONFIG = {
   LIMIT_DEN: 15,          // max. objednávek za 6 hodin celkem
   LIMIT_EMAIL: 2,         // max. objednávek na jeden e-mail za 6 hodin
   MAX_UCHOVANI_H: 720,    // max. doba uchování (30 dní)
-  FAKTURA_SPLATNOST: 14   // dní; faktura se vystaví ve FakturaOnline při schválení (klíč FAKTURAONLINE_API_KEY ve vlastnostech skriptu)
+  FAKTURA_SPLATNOST: 14,  // dní; faktura se vystaví ve FakturaOnline při schválení (klíč FAKTURAONLINE_API_KEY ve vlastnostech skriptu)
+  // e-mailová avíza ČSOB o příchozích platbách (Internetbanking → Nastavení → avízo o zaúčtování platby → e-mail)
+  BANK_QUERY: 'from:csob.cz newer_than:30d -label:gdpr-platba-zpracovano',
+  BANK_LABEL: 'gdpr-platba-zpracovano'
 };
 // =====================================================
 
@@ -123,13 +126,19 @@ function doPost(e) {
 
 function doGet(e) {
   const p = e.parameter || {};
-  if (p.a !== 'approve') return HtmlService.createHtmlOutput('OK');
-  if (p.c === '1') return approve_(p.id, p.t);
-  const u = ScriptApp.getService().getUrl() + '?a=approve&c=1&id=' + encodeURIComponent(p.id) + '&t=' + encodeURIComponent(p.t);
-  return HtmlService.createHtmlOutput('<div style="font-family:Arial;padding:40px;font-size:18px">Odeslat dokumenty k objednávce <b>' + esc(p.id) +
-    '</b> klientovi?<br><br><a target="_top" href="' + esc(u) + '" style="background:#0a7;color:#fff;padding:10px 18px;text-decoration:none;border-radius:4px">Ano, odeslat</a></div>');
+  if (p.a !== 'approve' && p.a !== 'send') return HtmlService.createHtmlOutput('OK');
+  if (p.c === '1') return p.a === 'send' ? sendNow_(p.id, p.t) : approve_(p.id, p.t);
+  const u = ScriptApp.getService().getUrl() + '?a=' + p.a + '&c=1&id=' + encodeURIComponent(p.id) + '&t=' + encodeURIComponent(p.t);
+  const otazka = p.a === 'send' ? 'Odeslat dokumenty k objednávce <b>' + esc(p.id) + '</b> klientovi hned (bez čekání na platbu)?' :
+    'Schválit objednávku <b>' + esc(p.id) + '</b>, vystavit fakturu a poslat ji klientovi?<br><span style="font-size:15px;color:#555">Dokumenty odejdou automaticky po zaplacení.</span>';
+  return HtmlService.createHtmlOutput('<div style="font-family:Arial;padding:40px;font-size:18px">' + otazka +
+    '<br><br><a target="_top" href="' + esc(u) + '" style="background:#0a7;color:#fff;padding:10px 18px;text-decoration:none;border-radius:4px">Ano</a></div>');
 }
 
+// Sloupce tabulky (1 = A): 3 Stav, 16 Odesláno, 17 Dokumenty, 18 Faktura (číslo), 19 Faktura ID, 20 Zaplaceno
+const COL = { STAV: 3, ODESLANO: 16, DOCS: 17, FAKTURA: 18, FAKTURA_ID: 19, ZAPLACENO: 20 };
+
+// Schválení: vystaví fakturu a pošle ji klientovi. Dokumenty odejdou až po zaplacení (checkPayments).
 function approve_(id, token) {
   const lock = LockService.getScriptLock();
   lock.waitLock(20000);
@@ -139,32 +148,156 @@ function approve_(id, token) {
     for (let i = 1; i < rows.length; i++) {
       if (rows[i][1] !== id) continue;
       if (rows[i][13] !== token) return page_('Neplatný odkaz.');
-      if (rows[i][2] === 'odesláno') return page_('Dokumenty k objednávce ' + id + ' už byly odeslány.');
+      const stav = rows[i][COL.STAV - 1];
+      if (stav === 'odesláno') return page_('Dokumenty k objednávce ' + id + ' už byly odeslány.');
+      if (stav === 'čeká na platbu') return page_('Faktura k objednávce ' + id + ' už byla odeslána, čeká se na platbu.');
       const data = JSON.parse(rows[i][14]);
-      const docIds = rows[i][16] ? JSON.parse(rows[i][16]) : [];
-      const files = docIds.map(function (fid) { return DriveApp.getFileById(fid); });
-      files.sort(function (x, y) { return x.getName() < y.getName() ? -1 : 1; });
-      const att = [];
-      let faktura = null, fakturaChyba = '';
-      try { faktura = createInvoice_(data, id); } catch (x) { fakturaChyba = String(x.message || x).slice(0, 300); }
-      if (faktura && faktura.pdf) att.push(faktura.pdf);
-      files.forEach(function (f) {
-        att.push(f.getAs('application/pdf').setName(f.getName() + '.pdf'));
-        const docx = exportDocx_(f.getId(), f.getName());
-        if (docx) att.push(docx);
-      });
-      sendClientDocs_(id, data, att, files.map(function (f) { return f.getName(); }), faktura);
-      sh.getRange(i + 1, 3).setValue('odesláno');
-      sh.getRange(i + 1, 16).setValue(new Date());
-      if (faktura) sh.getRange(i + 1, 18).setValue(t_(faktura.number));
-      return page_('Hotovo. ' + files.length + ' dokumentů (PDF + Word) odesláno na ' + data.kontakt.email + '. ' +
-        (faktura ? 'Faktura ' + faktura.number + ' vystavena ve FakturaOnline a přiložena.' :
-          'Faktura NEBYLA vystavena' + (fakturaChyba ? ' (' + fakturaChyba + ')' : '') + ' – vystavte ji prosím ručně.'));
+      if (!PropertiesService.getScriptProperties().getProperty('FAKTURAONLINE_API_KEY')) {
+        const n = deliverDocs_(sh, i + 1, rows[i], null);
+        return page_('Chybí FAKTURAONLINE_API_KEY – dokumenty (' + n + ') odeslány hned, fakturu vystavte ručně.');
+      }
+      let faktura;
+      try { faktura = createInvoice_(data, id); } catch (x) {
+        return page_('Fakturu se nepodařilo vystavit: ' + String(x.message || x).slice(0, 300) + '. Nic nebylo odesláno, zkuste to znovu.');
+      }
+      sendInvoiceToClient_(id, data, faktura);
+      sh.getRange(i + 1, COL.STAV).setValue('čeká na platbu');
+      sh.getRange(i + 1, COL.FAKTURA).setValue(t_(faktura.number));
+      sh.getRange(i + 1, COL.FAKTURA_ID).setValue(faktura.id);
+      return page_('Faktura ' + faktura.number + ' vystavena a odeslána na ' + data.kontakt.email +
+        '. Dokumenty odejdou automaticky, jakmile bude faktura ve FakturaOnline označena jako zaplacená (kontrola každou hodinu).');
     }
     return page_('Objednávka nenalezena.');
   } finally {
     lock.releaseLock();
   }
+}
+
+// Ruční odeslání dokumentů (např. platba hotově): ?a=send&id=…&t=…
+function sendNow_(id, token) {
+  const lock = LockService.getScriptLock();
+  lock.waitLock(20000);
+  try {
+    const sh = sheet_();
+    const rows = sh.getDataRange().getValues();
+    for (let i = 1; i < rows.length; i++) {
+      if (rows[i][1] !== id) continue;
+      if (rows[i][13] !== token) return page_('Neplatný odkaz.');
+      if (rows[i][COL.STAV - 1] === 'odesláno') return page_('Dokumenty k objednávce ' + id + ' už byly odeslány.');
+      const n = deliverDocs_(sh, i + 1, rows[i], null);
+      return page_('Dokumenty (' + n + ') odeslány na ' + JSON.parse(rows[i][14]).kontakt.email + '.');
+    }
+    return page_('Objednávka nenalezena.');
+  } finally {
+    lock.releaseLock();
+  }
+}
+
+// Spouští se každou hodinu (trigger z installTrigger):
+// 1) avíza ČSOB v Gmailu → podle VS a částky označí fakturu ve FakturaOnline jako zaplacenou
+// 2) zaplacené faktury (i ručně označené) → odeslat dokumenty
+function checkPayments() {
+  const key = PropertiesService.getScriptProperties().getProperty('FAKTURAONLINE_API_KEY');
+  if (!key) return;
+  const lock = LockService.getScriptLock();
+  if (!lock.tryLock(10000)) return;
+  try {
+    const sh = sheet_();
+    let rows = sh.getDataRange().getValues();
+    const cekajici = {};
+    for (let i = 1; i < rows.length; i++) {
+      if (rows[i][COL.STAV - 1] === 'čeká na platbu' && rows[i][COL.FAKTURA_ID - 1]) {
+        cekajici[String(rows[i][COL.FAKTURA - 1]).replace(/\D/g, '')] = i;
+      }
+    }
+    if (!Object.keys(cekajici).length) return;
+
+    // 1) bankovní avíza
+    const zaplaceno = {};
+    try {
+      const label = GmailApp.getUserLabelByName(CONFIG.BANK_LABEL) || GmailApp.createLabel(CONFIG.BANK_LABEL);
+      GmailApp.search(CONFIG.BANK_QUERY, 0, 50).forEach(function (thread) {
+        let pouzito = false;
+        thread.getMessages().forEach(function (msg) {
+          const p = parseBankAvizo_(msg.getPlainBody() || msg.getBody().replace(/<[^>]+>/g, ' '));
+          if (p.vs && cekajici[p.vs] !== undefined && p.castka >= CONFIG.PRICE_CZK) {
+            zaplaceno[p.vs] = msg.getDate();
+            pouzito = true;
+          }
+        });
+        if (pouzito) thread.addLabel(label);
+      });
+    } catch (x) { console.error('Gmail: ' + x); }
+
+    Object.keys(zaplaceno).forEach(function (vs) {
+      const invId = rows[cekajici[vs]][COL.FAKTURA_ID - 1];
+      UrlFetchApp.fetch('https://api.fakturaonline.cz/api/invoices/' + invId, {
+        method: 'patch', contentType: 'application/json', muteHttpExceptions: true,
+        headers: { 'X-Api-Key': key, Accept: 'application/json' }, payload: JSON.stringify({ paid: true })
+      });
+    });
+
+    // 2) stav faktur ve FakturaOnline
+    Object.keys(cekajici).forEach(function (vs) {
+      const i = cekajici[vs];
+      let paidAt = zaplaceno[vs] || null;
+      if (!paidAt) {
+        const r = UrlFetchApp.fetch('https://api.fakturaonline.cz/api/invoices/' + rows[i][COL.FAKTURA_ID - 1], {
+          headers: { 'X-Api-Key': key, Accept: 'application/json' }, muteHttpExceptions: true
+        });
+        if (r.getResponseCode() === 200) {
+          const j = JSON.parse(r.getContentText());
+          const inv = j.invoice || j;
+          if (inv.paid) paidAt = inv.paid_at || new Date();
+        }
+      }
+      if (paidAt) deliverDocs_(sh, i + 1, rows[i], paidAt);
+    });
+  } finally {
+    lock.releaseLock();
+  }
+}
+
+// Vytáhne VS a částku z textu avíza banky (tolerantní k formátu)
+function parseBankAvizo_(text) {
+  const t = String(text).replace(/\u00a0/g, ' ');
+  let vs = '';
+  const mVs = t.match(/(?:variabiln[íi]\s*symbol|\bVS\b)\s*[:.]?\s*0*(\d{1,10})/i);
+  if (mVs) vs = mVs[1];
+  let castka = 0;
+  const mC = t.match(/(?:[čc][áa]stka|amount|p[řr][íi]choz[íi][^\n]{0,40}?)\s*[:.]?\s*\+?\s*([\d ]{1,12}(?:[.,]\d{1,2})?)\s*(?:CZK|K[čc])/i) ||
+    t.match(/\+\s*([\d ]{1,12}(?:[.,]\d{1,2})?)\s*(?:CZK|K[čc])/i);
+  if (mC) castka = Number(mC[1].replace(/ /g, '').replace(',', '.')) || 0;
+  return { vs: vs, castka: castka };
+}
+
+function deliverDocs_(sh, rowNum, row, paidAt) {
+  const id = row[1];
+  const data = JSON.parse(row[14]);
+  const docIds = row[COL.DOCS - 1] ? JSON.parse(row[COL.DOCS - 1]) : [];
+  const files = docIds.map(function (fid) { return DriveApp.getFileById(fid); });
+  files.sort(function (x, y) { return x.getName() < y.getName() ? -1 : 1; });
+  const att = [];
+  files.forEach(function (f) {
+    att.push(f.getAs('application/pdf').setName(f.getName() + '.pdf'));
+    const docx = exportDocx_(f.getId(), f.getName());
+    if (docx) att.push(docx);
+  });
+  sendClientDocs_(id, data, att, files.map(function (f) { return f.getName(); }), !!paidAt);
+  sh.getRange(rowNum, COL.STAV).setValue('odesláno');
+  sh.getRange(rowNum, COL.ODESLANO).setValue(new Date());
+  if (paidAt) sh.getRange(rowNum, COL.ZAPLACENO).setValue(paidAt);
+  MailApp.sendEmail({ to: CONFIG.OWNER_EMAIL, subject: 'GDPR kamery – ' + id + ' – dokumenty odeslány' + (paidAt ? ' (zaplaceno)' : ''),
+    htmlBody: '<p>Objednávka <b>' + esc(id) + '</b> (' + esc(data.spravce.nazev) + '): ' + files.length + ' dokumentů odesláno na ' + esc(data.kontakt.email) + '.' +
+      (paidAt ? ' Faktura ' + esc(row[COL.FAKTURA - 1]) + ' je zaplacená.' : '') + '</p>' });
+  return files.length;
+}
+
+// Spusťte jednou z editoru: hodinová kontrola plateb
+function installTrigger() {
+  ScriptApp.getProjectTriggers().forEach(function (t) { if (t.getHandlerFunction() === 'checkPayments') ScriptApp.deleteTrigger(t); });
+  ScriptApp.newTrigger('checkPayments').timeBased().everyHours(1).create();
+  Logger.log('Trigger checkPayments: každou hodinu');
 }
 
 // ===================== NASTAVENÍ (spustit jednou) =====================
@@ -174,7 +307,7 @@ function setup() {
   if (!props.getProperty('SHEET_ID')) {
     const ss = SpreadsheetApp.create('GDPR kamery – objednávky');
     ss.getSheets()[0].appendRow(['Datum', 'ID', 'Stav', 'Správce', 'IČO', 'E-mail', 'Telefon',
-      'Kamer', 'Třída', 'Skóre ohrožení', 'Test splněn', 'Složka', 'ID složky', 'Token', 'Data', 'Odesláno', 'Dokumenty', 'Faktura']);
+      'Kamer', 'Třída', 'Skóre ohrožení', 'Test splněn', 'Složka', 'ID složky', 'Token', 'Data', 'Odesláno', 'Dokumenty', 'Faktura', 'Faktura ID', 'Zaplaceno']);
     props.setProperty('SHEET_ID', ss.getId());
   }
   if (!props.getProperty('ROOT_FOLDER_ID')) {
@@ -651,22 +784,31 @@ function notifyOwner_(id, token, d, a, folderUrl, ohrozeniText) {
   if (a.varovani.length) html += '<p style="color:#a00"><b>Upozornění:</b><br>' + a.varovani.map(function (v) { return esc(v); }).join('<br>') + '</p>';
   if (ohrozeniText) html += '<p><b>Text od Claude (zkontrolujte v balančním testu):</b><br>' + esc(ohrozeniText) + '</p>';
   html += '<p>1) Zkontrolujte a případně upravte dokumenty: <a href="' + folderUrl + '">složka v Drive</a></p>';
-  html += '<p>2) Faktura na ' + CONFIG.PRICE_CZK + ' Kč se vystaví automaticky ve FakturaOnline při schválení' +
-    (PropertiesService.getScriptProperties().getProperty('FAKTURAONLINE_API_KEY') ? '.' : ' – <b>chybí FAKTURAONLINE_API_KEY, vystavte ji ručně</b>.') + '</p>';
-  html += '<p>3) <a href="' + url + '" style="background:#0a7;color:#fff;padding:8px 14px;text-decoration:none;border-radius:4px">Schválit a odeslat klientovi</a> (otevře se potvrzení)</p>';
+  html += '<p>2) <a href="' + url + '" style="background:#0a7;color:#fff;padding:8px 14px;text-decoration:none;border-radius:4px">Schválit a poslat fakturu</a> – vystaví fakturu ' + CONFIG.PRICE_CZK +
+    ' Kč ve FakturaOnline a pošle ji klientovi. Dokumenty odejdou automaticky po zaplacení (označte fakturu jako zaplacenou ve FakturaOnline).</p>';
+  html += '<p style="font-size:13px;color:#555">Platba hotově nebo výjimka: <a href="' + url.replace('?a=approve', '?a=send') + '">odeslat dokumenty hned</a>.</p>';
   MailApp.sendEmail({ to: CONFIG.OWNER_EMAIL, subject: 'GDPR kamery – objednávka ' + id + ' – ' + d.spravce.nazev, htmlBody: html });
 }
 
 function sendClientConfirmation_(id, d) {
   const html = '<p>Dobrý den,</p><p>děkujeme za objednávku <b>' + id + '</b> – ' + CONFIG.SERVICE_NAME + '.</p>' +
-    '<p>Dokumenty jsme připravili podle Vašich údajů. Nyní zkontrolujeme jejich úplnost a soulad s Vašimi údaji a do 1 pracovního dne Vám je pošleme v PDF a Wordu spolu s fakturou (' +
-    CONFIG.PRICE_CZK + ' Kč, nejsme plátci DPH).</p>' +
+    '<p>Dokumenty jsme připravili podle Vašich údajů. Nyní zkontrolujeme jejich úplnost a soulad s Vašimi údaji a do 1 pracovního dne Vám pošleme fakturu (' +
+    CONFIG.PRICE_CZK + ' Kč, nejsme plátci DPH). Po jejím zaplacení Vám dokumenty automaticky odešleme v PDF a Wordu.</p>' +
     '<p>Pokud jste objednávku neodeslali Vy, tento e-mail prosím ignorujte.</p>' +
     '<p>S pozdravem<br>' + CONFIG.BRAND + '<br>' + CONFIG.SITE_URL + '</p>';
   sendAsBrand_(d.kontakt.email, 'Přijali jsme Vaši objednávku ' + id, html, null);
 }
 
-function sendClientDocs_(id, d, attachments, names, faktura) {
+function sendInvoiceToClient_(id, d, faktura) {
+  const html = '<p>Dobrý den,</p><p>Vaše dokumentace ke kamerovému systému (objednávka ' + id + ') je připravená a zkontrolovaná.</p>' +
+    '<p>V příloze zasíláme fakturu č. <b>' + esc(faktura.number) + '</b> na ' + CONFIG.PRICE_CZK + ' Kč' + (faktura.dueOn ? ', splatnou do ' + esc(faktura.dueOn) : '') +
+    '. Nejrychleji zaplatíte pomocí QR kódu na faktuře.</p>' +
+    '<p><b>Dokumenty Vám pošleme automaticky po připsání platby</b> (obvykle do 1 pracovního dne).</p>' +
+    '<p>S pozdravem<br>' + CONFIG.BRAND + '<br>' + CONFIG.SITE_URL + '</p>';
+  sendAsBrand_(d.kontakt.email, 'Faktura ' + faktura.number + ' – GDPR dokumentace ke kamerovému systému', html, faktura.pdf ? [faktura.pdf] : null);
+}
+
+function sendClientDocs_(id, d, attachments, names, zaplaceno) {
   const T = TERMINY[d.spravce.typ];
   const html = '<p>Dobrý den,</p><p>v příloze zasíláme dokumentaci ke kamerovému systému (objednávka ' + id + ') ve formátu PDF a Word:</p><ul>' +
     names.map(function (n) { return '<li>' + esc(n) + '</li>'; }).join('') + '</ul>' +
@@ -675,8 +817,7 @@ function sendClientDocs_(id, d, attachments, names, faktura) {
     '<li>Informaci o zpracování vyvěste na nástěnku v domě' + (d.web ? ' a na web ' + esc(d.web) : '') + '.</li>' +
     '<li>Evidenci přístupů veďte při každém prohlížení nebo předání záznamu.</li>' +
     '<li>Při změně kamer dokumentaci aktualizujte – stačí nám napsat.</li></ol>' +
-    (faktura ? '<p>V příloze je také faktura č. ' + esc(faktura.number) + ' na ' + CONFIG.PRICE_CZK + ' Kč' + (faktura.dueOn ? ', splatná do ' + esc(faktura.dueOn) : '') + '.</p>' :
-      '<p>Fakturu zasíláme samostatně.</p>') +
+    (zaplaceno ? '<p>Děkujeme za úhradu faktury.</p>' : '') +
     '<p>Dokumenty vycházejí z Metodiky ÚOOÚ a z Vašich údajů; nejde o právní službu.</p>' +
     '<p>Potřebujete kamery nainstalovat, rozšířit nebo opravit? Rádi pomůžeme – <a href="https://kamerovka.cz">kamerovka.cz</a>.</p>' +
     '<p>S pozdravem<br>' + CONFIG.BRAND + '</p>';
@@ -696,19 +837,33 @@ function sendAsBrand_(to, subject, html, attachments) {
 function createInvoice_(d, orderId) {
   const key = PropertiesService.getScriptProperties().getProperty('FAKTURAONLINE_API_KEY');
   if (!key) return null;
+  const H = { 'X-Api-Key': key, Accept: 'application/json' };
+  // 1) šablona nového dokladu: číslo z číselné řady + údaje dodavatele z nastavení účtu
+  const nr = UrlFetchApp.fetch('https://api.fakturaonline.cz/api/invoices/new?kind=invoice', { headers: H, muteHttpExceptions: true });
+  if (nr.getResponseCode() !== 200) throw new Error('FakturaOnline /new HTTP ' + nr.getResponseCode());
+  const tpl = JSON.parse(nr.getContentText());
+  const s = tpl.seller || {};
   const adr = parseAdresa_(d.spravce.sidlo || (d.objekt && d.objekt.adresa) || '');
   const body = {
     invoice: {
       kind: 'invoice',                       // neplátce DPH
+      number: tpl.number,
+      payment_symbol: tpl.payment_symbol || String(tpl.number || '').replace(/\D/g, ''),
+      currency: tpl.currency || 'CZK',
+      language: 'cs',
+      design: tpl.design || '4',
       means_of_payment: 'bank_transfer',
       due_in: CONFIG.FAKTURA_SPLATNOST,
-      language: 'cs',
       show_qr_code: true,
       order_number: String(orderId).replace(/[^A-Za-z0-9_\/-]/g, '').slice(0, 25),
+      seller_attributes: {
+        name: s.name, company_number: s.company_number, tax_number: s.tax_number || '',
+        address_attributes: { street: s.street, city: s.city, postcode: s.postcode, country_code: s.country_code || 'CZ' },
+        bank_account_attributes: { number: s.bank_account_number, iban: s.iban, swift: s.swift, show_iban: !!s.show_iban }
+      },
       buyer_attributes: {
         name: String(d.spravce.nazev).slice(0, 150),
         company_number: String(d.spravce.ico),
-        email: d.kontakt.email,
         address_attributes: { street: adr.street, city: adr.city, postcode: adr.postcode, country_code: 'CZ' }
       },
       lines_attributes: [{
@@ -717,21 +872,20 @@ function createInvoice_(d, orderId) {
       }]
     }
   };
+  // 2) vystavení
   const res = UrlFetchApp.fetch('https://api.fakturaonline.cz/api/invoices', {
-    method: 'post', contentType: 'application/json', muteHttpExceptions: true,
-    headers: { 'X-Api-Key': key, Accept: 'application/json' }, payload: JSON.stringify(body)
+    method: 'post', contentType: 'application/json', muteHttpExceptions: true, headers: H, payload: JSON.stringify(body)
   });
   const code = res.getResponseCode();
   if (code !== 201 && code !== 200) throw new Error('FakturaOnline HTTP ' + code + ': ' + res.getContentText().slice(0, 200));
   const j = JSON.parse(res.getContentText());
   const inv = j.invoice || {};
   const invId = j.invoice_id || inv.id;
+  // 3) PDF
   let pdf = null;
-  const p = UrlFetchApp.fetch('https://api.fakturaonline.cz/api/invoices/' + invId + '.pdf', {
-    headers: { 'X-Api-Key': key }, muteHttpExceptions: true
-  });
+  const p = UrlFetchApp.fetch('https://api.fakturaonline.cz/api/invoices/' + invId + '.pdf', { headers: { 'X-Api-Key': key }, muteHttpExceptions: true });
   if (p.getResponseCode() === 200) pdf = p.getBlob().setName('Faktura ' + (inv.number || invId) + '.pdf');
-  return { id: invId, number: inv.number || String(invId), dueOn: inv.due_on ? fmtDate_(new Date(inv.due_on + 'T12:00:00')) : '', pdf: pdf };
+  return { id: invId, number: inv.number || tpl.number || String(invId), dueOn: inv.due_on ? fmtDate_(new Date(inv.due_on + 'T12:00:00')) : '', pdf: pdf, pdfCode: p.getResponseCode(), state: inv.state };
 }
 
 // "Nad sokolovnou 125/9, Podolí, 14700 Praha 4" → ulice / PSČ / obec
