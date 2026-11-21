@@ -12,6 +12,7 @@
 
 // ===================== NASTAVENÍ =====================
 const CONFIG = {
+  EXEC_URL: 'https://script.google.com/macros/s/AKfycbxMQAS4rXziGccOMR_uQUdT7gpdNSpHEBInjx-7hv7Y8lQntar6WtAzgvHUzAJkI9o/exec', // pevná adresa web appu (getUrl() občas vrací /dev)
   OWNER_EMAIL: 'info@kamerovka.cz',         // kam chodí objednávky a platby
   FROM_EMAIL: 'info@kamerovka.cz',           // odesílatel e-mailů klientům (alias v Gmailu)
   BRAND: 'Kamerovka.cz',
@@ -134,7 +135,7 @@ function doGet(e) {
   const p = e.parameter || {};
   if (p.a !== 'approve' && p.a !== 'send') return HtmlService.createHtmlOutput('OK');
   if (p.c === '1') return p.a === 'send' ? sendNow_(p.id, p.t) : approve_(p.id, p.t);
-  const u = ScriptApp.getService().getUrl() + '?a=' + p.a + '&c=1&id=' + encodeURIComponent(p.id) + '&t=' + encodeURIComponent(p.t);
+  const u = CONFIG.EXEC_URL + '?a=' + p.a + '&c=1&id=' + encodeURIComponent(p.id) + '&t=' + encodeURIComponent(p.t);
   const otazka = p.a === 'send' ? 'Odeslat dokumenty k objednávce <b>' + esc(p.id) + '</b> klientovi hned (bez čekání na platbu)?' :
     'Schválit objednávku <b>' + esc(p.id) + '</b>, vystavit fakturu a poslat ji klientovi?<br><span style="font-size:15px;color:#555">Dokumenty odejdou automaticky po zaplacení.</span>';
   return HtmlService.createHtmlOutput('<div style="font-family:Arial;padding:40px;font-size:18px">' + otazka +
@@ -868,7 +869,7 @@ function claudeOhrozeni_(d, a) {
 // ===================== E-MAILY =====================
 
 function notifyOwner_(id, token, d, a, folderUrl, ohrozeniText) {
-  const url = ScriptApp.getService().getUrl() + '?a=approve&id=' + encodeURIComponent(id) + '&t=' + encodeURIComponent(token);
+  const url = CONFIG.EXEC_URL + '?a=approve&id=' + encodeURIComponent(id) + '&t=' + encodeURIComponent(token);
   let html = '<h2>Nová objednávka ' + id + '</h2>';
   html += '<p><b>' + esc(d.spravce.nazev) + '</b> (IČO ' + esc(d.spravce.ico) + ', typ ' + esc(d.spravce.typ) + ')<br>' + kontaktLine_(d) + '<br>Objekt: ' + adresaObjektu_(d) + '</p>';
   html += '<p>Kamer: ' + d.kamery.length + ' | Třída: ' + a.tridaMax + ' | Skóre ohrožení: ' + a.skore + ' (' + (a.prosel ? 'OK' : 'NESPLNĚNO') + ')' +
