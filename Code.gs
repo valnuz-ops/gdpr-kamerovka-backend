@@ -18,7 +18,10 @@ const CONFIG = {
   SERVICE_NAME: 'GDPR dokumentace ke kamerovému systému',
   SITE_URL: 'https://gdpr.kamerovka.cz',
   OPERATOR: 'Oleksii Bilan, IČO 19670168',
-  PRICE_CZK: 990,
+  TARIFY: {
+    zaklad: { nazev: 'Základ', cena: 990 },
+    standard: { nazev: 'Standard', cena: 1990 }   // + podklady ke shromáždění, oznámení obyvatelům, 12 měsíců aktualizací
+  },
   CLAUDE_MODEL: 'claude-sonnet-5-5',
   TZ: 'Europe/Prague',
   LIMIT_DEN: 15,          // max. objednávek za 6 hodin celkem
@@ -220,7 +223,7 @@ function checkPayments() {
         let pouzito = false;
         thread.getMessages().forEach(function (msg) {
           const p = parseBankAvizo_(msg.getPlainBody() || msg.getBody().replace(/<[^>]+>/g, ' '));
-          if (p.vs && cekajici[p.vs] !== undefined && p.castka >= CONFIG.PRICE_CZK) {
+          if (p.vs && cekajici[p.vs] !== undefined && p.castka >= cena_(JSON.parse(rows[cekajici[p.vs]][14]))) {
             zaplaceno[p.vs] = msg.getDate();
             pouzito = true;
           }
@@ -337,6 +340,7 @@ function validate_(d) {
 function normalize_(d) {
   const cut = function (s, n) { return String(s == null ? '' : s).slice(0, n); };
   d.spravce.typ = TERMINY[d.spravce.typ] ? d.spravce.typ : 'SVJ';
+  d.tarif = CONFIG.TARIFY[d.tarif] ? d.tarif : 'zaklad';
   d.kamery.forEach(function (k) {
     k.popis = cut(k.popis, 120);
     k.rezim = k.rezim === 'online' ? 'online' : 'zaznam';
@@ -429,9 +433,12 @@ function buildDocs(d, a, meta) {
     { title: '5 Směrnice k provozu kamerového systému', html: docSmernice_(ctx) },
     { title: '6 Evidence přístupů a předání záznamů', html: docEvidence_(ctx) }
   ];
-  if (d.schvaleni && d.schvaleni.stav === 'ne' && d.spravce.typ !== 'vlastnik') {
+  const standard = d.tarif === 'standard';
+  if (d.spravce.typ !== 'vlastnik' && (standard || (d.schvaleni && d.schvaleni.stav === 'ne'))) {
     docs.push({ title: '7 Návrh usnesení', html: docUsneseni_(ctx) });
   }
+  if (standard && d.spravce.typ !== 'vlastnik') docs.push({ title: '8 Pozvánka a podklad pro ' + (d.spravce.typ === 'BD' ? 'členskou schůzi' : 'shromáždění'), html: docPozvanka_(ctx) });
+  if (standard) docs.push({ title: '9 Oznámení obyvatelům domu', html: docOznameni_(ctx) });
   return docs;
 }
 
@@ -742,6 +749,15 @@ function docEvidence_(ctx) {
 function docUsneseni_(ctx) {
   const d = ctx.d, a = ctx.a, T = a.T;
   let h = '<p><b>' + esc(d.spravce.nazev) + '</b>, IČO ' + esc(d.spravce.ico) + '</p>';
+  if (d.schvaleni && d.schvaleni.stav === 'ano') {
+    h += '<p>' + cap_(T.schuze2) + ' bere na vědomí dokumentaci kamerového systému ve společných částech domu ' + adresaObjektu_(d) +
+      ' (balanční test, záznam o činnostech zpracování, informace pro obyvatele) a schvaluje směrnici k provozu kamerového systému' +
+      (a.zaznam ? ' s dobou uchování záznamu nejvýše ' + sklon_(a.maxUchovani, 'hodinu', 'hodiny', 'hodin') : '') +
+      '. Osobami oprávněnými k přístupu ' + (a.zaznam ? 'k záznamům' : 'k obrazu') + ' určuje: ' + esc(d.provoz.osoby || T.clenove) + '.</p>';
+    h += '<p>Hlasování: pro ……… / proti ……… / zdržel se ………</p>';
+    h += '<p class="small">Instalace byla schválena již dříve' + (d.schvaleni.datum ? ' (' + esc(d.schvaleni.datum) + ')' : '') + '; toto usnesení doplňuje schválení o pravidla provozu. Návrh přizpůsobte ' + (d.spravce.typ === 'BD' ? 'stanovám družstva' : 'stanovám SVJ') + '.</p>';
+    return wrap_('Návrh usnesení', h, ctx);
+  }
   h += '<p>' + cap_(T.schuze2) + ' schvaluje instalaci a provoz kamerového systému ve společných částech domu ' + adresaObjektu_(d) +
     ' v rozsahu: ' + pocetKamer_(d) + ' (umístění: ' + esc(d.kamery.map(function (k) { return MISTA[k.misto]; }).join(', ')) + ')' +
     ', za účelem ochrany majetku a bezpečnosti osob' + (a.zaznam ? ', se záznamem uchovávaným nejvýše ' + sklon_(a.maxUchovani, 'hodinu', 'hodiny', 'hodin') : '') +
@@ -751,6 +767,53 @@ function docUsneseni_(ctx) {
   h += '<p class="small">Návrh je nutné přizpůsobit ' + (d.spravce.typ === 'BD' ? 'stanovám družstva' : 'stanovám SVJ') + ' (kvórum, způsob hlasování).</p>';
   return wrap_('Návrh usnesení', h, ctx);
 }
+
+// ---------- 8. Pozvánka a podklad (Standard) ----------
+function docPozvanka_(ctx) {
+  const d = ctx.d, a = ctx.a, T = a.T;
+  const bd = d.spravce.typ === 'BD';
+  const schvaleno = d.schvaleni && d.schvaleni.stav === 'ano';
+  let h = '<p><b>' + esc(d.spravce.nazev) + '</b>, IČO ' + esc(d.spravce.ico) + (d.spravce.sidlo ? '<br>' + esc(d.spravce.sidlo) : '') + '</p>';
+  h += '<h2>Pozvánka</h2><p>' + cap_(T.organ) + ' svolává ' + T.schuze + ', které se bude konat dne ……………… od ……… hodin v ……………………………….</p>';
+  h += '<p><b>Program:</b></p><ol><li>Zahájení, kontrola usnášeníschopnosti</li><li>Volba zapisovatele' + (bd ? '' : ' a ověřovatele zápisu') + '</li>' +
+    '<li><b>Kamerový systém ve společných částech domu – ' + (schvaleno ? 'pravidla provozu' : 'schválení instalace a provozu') + '</b></li>' +
+    '<li>……………………………</li><li>Závěr</li></ol>';
+  h += '<p>Podklad k bodu 3 je přiložen k této pozvánce' + (d.web ? ' a zveřejněn na ' + esc(d.web) : '') + '. Pozvánku rozešlete a vyvěste ve lhůtě podle ' +
+    (bd ? 'stanov družstva' : 'stanov SVJ (podle zákona nejméně 15 dní před konáním shromáždění)') + '.</p>';
+  h += '<p>V ………………… dne …………………<br><br>…………………………………<br>za ' + T.organ + '</p>';
+  h += '<h2>Podklad k bodu 3: kamerový systém</h2>';
+  h += '<p><b>Proč:</b> za posledních ' + a.mesicu + ' měsíců evidujeme v domě ' + sklon_(a.pocet, 'událost', 'události', 'událostí') +
+    (a.skoda ? ' se škodou přibližně ' + czk_(a.skoda) + ' Kč' : '') + ' (' + esc(d.incidenty.map(function (i) { return INCIDENTY[i.typ]; }).join(', ')) + ').' +
+    (d.opatreni.length ? ' Dosavadní opatření (' + esc(d.opatreni.map(function (o) { return OPATRENI[o]; }).join(', ')) + ') nestačila.' : '') + '</p>';
+  h += '<p><b>Rozsah:</b> ' + pocetKamer_(d) + ' – ' + esc(d.kamery.map(function (k) { return MISTA[k.misto]; }).join(', ')) + '.</p>';
+  h += '<p><b>Soukromí:</b> kamery snímají jen společné části domu' + (d.provoz.maskovani ? ', ne vstupní dveře bytů ani okna' : '') +
+    (a.zaznam ? '; záznam se uchovává nejvýše ' + sklon_(a.maxUchovani, 'hodinu', 'hodiny', 'hodin') + ' a pak se automaticky maže' : '; záznam se nepořizuje') +
+    '; záznam se prohlíží jen při události a přístup mají pouze ' + esc(d.provoz.osoby || T.clenove) + '; každý přístup se eviduje; systém nenahrává zvuk.</p>';
+  if (d.naklady > 0) h += '<p><b>Náklady:</b> přibližně ' + czk_(d.naklady) + ' Kč, hrazeno ' + T.naklady + '.</p>';
+  h += '<p><b>GDPR:</b> správcem osobních údajů je ' + esc(d.spravce.nazev) + '. Oprávněný zájem je posouzen balančním testem podle metodiky ÚOOÚ; ' +
+    'dokumentace (balanční test, záznam o činnostech zpracování, směrnice, informační tabulky) je k nahlédnutí u ' + T.organ2 + '.</p>';
+  h += '<p><b>Návrh usnesení:</b> viz samostatný dokument „Návrh usnesení“.</p>';
+  return wrap_('Pozvánka a podklad pro ' + (bd ? 'členskou schůzi' : 'shromáždění'), h, ctx);
+}
+
+// ---------- 9. Oznámení obyvatelům (Standard) ----------
+function docOznameni_(ctx) {
+  const d = ctx.d, a = ctx.a, T = a.T;
+  let h = '<p>Vážení obyvatelé domu ' + adresaObjektu_(d) + ',</p>';
+  h += '<p>' + (d.vProvozu ? 'v domě je provozován' : 'v domě bude od ……………… spuštěn') + ' kamerový systém (' + pocetKamer_(d) + ': ' +
+    esc(d.kamery.map(function (k) { return MISTA[k.misto]; }).join(', ')) + '). Jeho účelem je ochrana majetku a bezpečnosti osob ve společných částech domu.</p><ul>';
+  h += '<li>Kamery snímají pouze společné prostory' + (d.provoz.maskovani ? ', nikoli dveře bytů ani okna' : '') + ', bez zvuku.</li>';
+  h += a.zaznam ? '<li>Záznam se uchovává nejvýše ' + sklon_(a.maxUchovani, 'hodinu', 'hodiny', 'hodin') + ', poté se automaticky přemaže.</li>' : '<li>Záznam se nepořizuje, obraz se pouze přenáší.</li>';
+  h += '<li>Záznam se prohlíží jen v případě události (krádež, poškození, ohrožení osob). Přístup mají pouze: ' + esc(d.provoz.osoby || T.clenove) + '. Každý přístup se zapisuje.</li>';
+  h += '<li>Záznam se předává jen Policii ČR, správním orgánům, pojišťovně nebo osobě, které se týká.</li></ul>';
+  h += '<p>Podrobné informace o zpracování osobních údajů a o Vašich právech najdete ' + (d.web ? 'na ' + esc(d.web) + ' a ' : '') + 'na nástěnce v domě. ' +
+    'Dotazy, žádosti o přístup k záznamu nebo námitky směřujte na: ' + kontaktLine_(d) + '.</p>';
+  h += '<p>Děkujeme za pochopení.<br>' + (d.spravce.typ === 'vlastnik' ? 'Vlastník domu' : cap_(T.organ) + ' – ' + esc(d.spravce.nazev)) + '</p>';
+  return wrap_('Oznámení o kamerovém systému v domě', h, ctx);
+}
+
+function cena_(d) { return (CONFIG.TARIFY[d && d.tarif] || CONFIG.TARIFY.zaklad).cena; }
+function tarifNazev_(d) { return (CONFIG.TARIFY[d && d.tarif] || CONFIG.TARIFY.zaklad).nazev; }
 
 // ===================== CLAUDE =====================
 
@@ -780,11 +843,11 @@ function notifyOwner_(id, token, d, a, folderUrl, ohrozeniText) {
   let html = '<h2>Nová objednávka ' + id + '</h2>';
   html += '<p><b>' + esc(d.spravce.nazev) + '</b> (IČO ' + esc(d.spravce.ico) + ', typ ' + esc(d.spravce.typ) + ')<br>' + kontaktLine_(d) + '<br>Objekt: ' + adresaObjektu_(d) + '</p>';
   html += '<p>Kamer: ' + d.kamery.length + ' | Třída: ' + a.tridaMax + ' | Skóre ohrožení: ' + a.skore + ' (' + (a.prosel ? 'OK' : 'NESPLNĚNO') + ')' +
-    ' | V provozu: ' + (d.vProvozu ? 'ano' : 'ne') + '</p>';
+    ' | V provozu: ' + (d.vProvozu ? 'ano' : 'ne') + ' | <b>Tarif: ' + tarifNazev_(d) + ' (' + cena_(d) + ' Kč)</b></p>';
   if (a.varovani.length) html += '<p style="color:#a00"><b>Upozornění:</b><br>' + a.varovani.map(function (v) { return esc(v); }).join('<br>') + '</p>';
   if (ohrozeniText) html += '<p><b>Text od Claude (zkontrolujte v balančním testu):</b><br>' + esc(ohrozeniText) + '</p>';
   html += '<p>1) Zkontrolujte a případně upravte dokumenty: <a href="' + folderUrl + '">složka v Drive</a></p>';
-  html += '<p>2) <a href="' + url + '" style="background:#0a7;color:#fff;padding:8px 14px;text-decoration:none;border-radius:4px">Schválit a poslat fakturu</a> – vystaví fakturu ' + CONFIG.PRICE_CZK +
+  html += '<p>2) <a href="' + url + '" style="background:#0a7;color:#fff;padding:8px 14px;text-decoration:none;border-radius:4px">Schválit a poslat fakturu</a> – vystaví fakturu ' + cena_(d) +
     ' Kč ve FakturaOnline a pošle ji klientovi. Dokumenty odejdou automaticky po zaplacení (označte fakturu jako zaplacenou ve FakturaOnline).</p>';
   html += '<p style="font-size:13px;color:#555">Platba hotově nebo výjimka: <a href="' + url.replace('?a=approve', '?a=send') + '">odeslat dokumenty hned</a>.</p>';
   MailApp.sendEmail({ to: CONFIG.OWNER_EMAIL, subject: 'GDPR kamery – objednávka ' + id + ' – ' + d.spravce.nazev, htmlBody: html });
@@ -793,7 +856,7 @@ function notifyOwner_(id, token, d, a, folderUrl, ohrozeniText) {
 function sendClientConfirmation_(id, d) {
   const html = '<p>Dobrý den,</p><p>děkujeme za objednávku <b>' + id + '</b> – ' + CONFIG.SERVICE_NAME + '.</p>' +
     '<p>Dokumenty jsme připravili podle Vašich údajů. Nyní zkontrolujeme jejich úplnost a soulad s Vašimi údaji a do 1 pracovního dne Vám pošleme fakturu (' +
-    CONFIG.PRICE_CZK + ' Kč, nejsme plátci DPH). Po jejím zaplacení Vám dokumenty automaticky odešleme v PDF a Wordu.</p>' +
+    cena_(d) + ' Kč, tarif ' + tarifNazev_(d) + ', nejsme plátci DPH). Po jejím zaplacení Vám dokumenty automaticky odešleme v PDF a Wordu.</p>' +
     '<p>Pokud jste objednávku neodeslali Vy, tento e-mail prosím ignorujte.</p>' +
     '<p>S pozdravem<br>' + CONFIG.BRAND + '<br>' + CONFIG.SITE_URL + '</p>';
   sendAsBrand_(d.kontakt.email, 'Přijali jsme Vaši objednávku ' + id, html, null);
@@ -801,7 +864,7 @@ function sendClientConfirmation_(id, d) {
 
 function sendInvoiceToClient_(id, d, faktura) {
   const html = '<p>Dobrý den,</p><p>Vaše dokumentace ke kamerovému systému (objednávka ' + id + ') je připravená a zkontrolovaná.</p>' +
-    '<p>V příloze zasíláme fakturu č. <b>' + esc(faktura.number) + '</b> na ' + CONFIG.PRICE_CZK + ' Kč' + (faktura.dueOn ? ', splatnou do ' + esc(faktura.dueOn) : '') +
+    '<p>V příloze zasíláme fakturu č. <b>' + esc(faktura.number) + '</b> na ' + cena_(d) + ' Kč' + (faktura.dueOn ? ', splatnou do ' + esc(faktura.dueOn) : '') +
     '. Nejrychleji zaplatíte pomocí QR kódu na faktuře.</p>' +
     '<p><b>Dokumenty Vám pošleme automaticky po připsání platby</b> (obvykle do 1 pracovního dne).</p>' +
     '<p>S pozdravem<br>' + CONFIG.BRAND + '<br>' + CONFIG.SITE_URL + '</p>';
@@ -816,7 +879,8 @@ function sendClientDocs_(id, d, attachments, names, zaplaceno) {
     '<li>Informační tabulku vytiskněte a umístěte před vstup do záběru každé kamery – ve výšce očí, čitelně ze vzdálenosti 2–5 m (A4 nebo A5). Na tabulku doporučujeme uvést obecný kontakt domu, nikoli osobní telefon.</li>' +
     '<li>Informaci o zpracování vyvěste na nástěnku v domě' + (d.web ? ' a na web ' + esc(d.web) : '') + '.</li>' +
     '<li>Evidenci přístupů veďte při každém prohlížení nebo předání záznamu.</li>' +
-    '<li>Při změně kamer dokumentaci aktualizujte – stačí nám napsat.</li></ol>' +
+    (d.tarif === 'standard' ? '<li>Pozvánku a podklad rozešlete s programem shromáždění, oznámení vyvěste na nástěnku.</li>' : '') +
+    '<li>Při změně kamer dokumentaci aktualizujte – stačí nám napsat' + (d.tarif === 'standard' ? ' (v tarifu Standard 12 měsíců zdarma)' : '') + '.</li></ol>' +
     (zaplaceno ? '<p>Děkujeme za úhradu faktury.</p>' : '') +
     '<p>Dokumenty vycházejí z Metodiky ÚOOÚ a z Vašich údajů; nejde o právní službu.</p>' +
     '<p>Potřebujete kamery nainstalovat, rozšířit nebo opravit? Rádi pomůžeme – <a href="https://kamerovka.cz">kamerovka.cz</a>.</p>' +
@@ -867,8 +931,8 @@ function createInvoice_(d, orderId) {
         address_attributes: { street: adr.street, city: adr.city, postcode: adr.postcode, country_code: 'CZ' }
       },
       lines_attributes: [{
-        description: 'GDPR dokumentace ke kamerovému systému' + (d.objekt && d.objekt.adresa ? ' – ' + String(d.objekt.adresa).slice(0, 120) : '') + ' (obj. ' + orderId + ')',
-        price: String(CONFIG.PRICE_CZK), quantity: '1', unit_type: 'ks', vat_rate: '0'
+        description: 'GDPR dokumentace ke kamerovému systému – tarif ' + tarifNazev_(d) + (d.objekt && d.objekt.adresa ? ' – ' + String(d.objekt.adresa).slice(0, 120) : '') + ' (obj. ' + orderId + ')',
+        price: String(cena_(d)), quantity: '1', unit_type: 'ks', vat_rate: '0'
       }]
     }
   };
