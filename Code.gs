@@ -531,19 +531,29 @@ function docInformace_(ctx) {
 }
 
 // ---------- 4. Informační tabulka ----------
+// Design podle samolepky Kamerovka.cz: žlutá #FFD400, silný černý rámeček, piktogram kamery
 function docTabulka_(ctx) {
   const d = ctx.d, a = ctx.a;
-  const kde = d.web ? esc(d.web) : 'na nástěnce v domě';
-  const prava = a.zaznam ? 'Máte právo na přístup k záznamu, na výmaz, omezení zpracování, námitku a stížnost u ÚOOÚ.' :
-    'Máte právo vznést námitku, požadovat omezení zpracování a podat stížnost u ÚOOÚ.';
-  let h = '<table style="border:3pt solid #000;width:100%"><tr><td style="border:none;text-align:center;padding:16pt">';
-  h += '<p><img src="' + PICTOGRAM_URL + '" width="140" height="140" alt="kamera"></p>';
-  h += '<p style="font-size:26pt;font-weight:bold;margin:6pt 0">PROSTOR JE MONITOROVÁN<br>KAMEROVÝM SYSTÉMEM' + (a.zaznam ? ' SE ZÁZNAMEM' : '') + '</p>';
-  h += '<p style="font-size:14pt">Správce: <b>' + esc(d.spravce.nazev) + '</b>, IČO ' + esc(d.spravce.ico) + '</p>';
-  h += '<p style="font-size:13pt">Účel: ochrana majetku a bezpečnosti osob<br>Právní základ: oprávněný zájem, čl. 6 odst. 1 písm. f) GDPR' +
-    (a.zaznam ? '<br>Doba uchování záznamu: nejvýše ' + sklon_(a.maxUchovani, 'hodina', 'hodiny', 'hodin') : '') + '</p>';
-  h += '<p style="font-size:12pt">Kontakt a uplatnění práv: ' + esc(d.kontakt.jmeno) + ', ' + esc(d.kontakt.email) + (d.kontakt.telefon ? ', ' + esc(d.kontakt.telefon) : '') + '</p>';
-  h += '<p style="font-size:12pt">' + prava + '<br>Podrobné informace: ' + kde + '</p>';
+  const kde = d.web ? esc(d.web) : 'u správce a na nástěnce v domě';
+  const prava = a.zaznam ? 'přístup k záznamu, výmaz, omezení zpracování, námitka; stížnost u ÚOOÚ (www.uoou.gov.cz)' :
+    'námitka a omezení zpracování; stížnost u ÚOOÚ (www.uoou.gov.cz)';
+  const row = function (k, v) {
+    return '<p style="font-size:12pt;margin:0 0 5pt 0"><b>' + k + '</b> ' + v + '</p>';
+  };
+  let h = '<table style="border-collapse:collapse;width:100%">';
+  h += '<tr><td style="background-color:#FFD400;border:6pt solid #111111;text-align:center;padding:14pt 12pt 16pt 12pt">';
+  h += '<p style="margin:0"><img src="' + PICTOGRAM_URL + '" width="230" height="157" alt="kamera"></p>';
+  h += '<p style="font-family:Arial;font-size:30pt;font-weight:bold;line-height:1.05;margin:8pt 0 0 0;color:#111111">OBJEKT JE MONITOROVÁN<br>KAMEROVÝM SYSTÉMEM</p>';
+  h += '<p style="font-family:Arial;font-size:15pt;font-weight:bold;margin:6pt 0 0 0;color:#111111">' + (a.zaznam ? 'SE ZÁZNAMEM' : 'BEZ ZÁZNAMU – ONLINE PŘENOS') + '</p>';
+  h += '</td></tr>';
+  h += '<tr><td style="background-color:#FFFFFF;border:6pt solid #111111;padding:12pt 14pt">';
+  h += row('Správce:', esc(d.spravce.nazev) + ', IČO ' + esc(d.spravce.ico));
+  h += row('Kontakt:', esc(d.kontakt.jmeno) + ', ' + esc(d.kontakt.email) + (d.kontakt.telefon ? ', ' + esc(d.kontakt.telefon) : ''));
+  h += row('Účel:', 'ochrana majetku, zdraví a bezpečnosti osob');
+  h += row('Právní základ:', 'oprávněný zájem správce – čl. 6 odst. 1 písm. f) GDPR');
+  if (a.zaznam) h += row('Doba uchování:', 'nejvýše ' + sklon_(a.maxUchovani, 'hodina', 'hodiny', 'hodin') + ', poté se záznam automaticky maže');
+  h += row('Vaše práva:', prava);
+  h += row('Více informací:', kde);
   h += '</td></tr></table>';
   return '<html><head><meta charset="utf-8">' + css_() + '</head><body>' + h + '</body></html>';
 }
