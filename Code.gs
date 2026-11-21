@@ -542,7 +542,7 @@ function docTabulka_(ctx) {
   };
   let h = '<table style="border-collapse:collapse;width:100%">';
   h += '<tr><td style="background-color:#FFD400;border:6pt solid #111111;text-align:center;padding:14pt 12pt 16pt 12pt">';
-  h += '<p style="margin:0"><img src="' + PICTOGRAM_URL + '" width="230" height="157" alt="kamera"></p>';
+  h += '<p style="margin:0"><img src="' + PICTOGRAM_URL + '" width="240" height="160" alt="kamera"></p>';
   h += '<p style="font-family:Arial;font-size:30pt;font-weight:bold;line-height:1.05;margin:8pt 0 0 0;color:#111111">OBJEKT JE MONITOROVÁN<br>KAMEROVÝM SYSTÉMEM</p>';
   h += '<p style="font-family:Arial;font-size:15pt;font-weight:bold;margin:6pt 0 0 0;color:#111111">' + (a.zaznam ? 'SE ZÁZNAMEM' : 'BEZ ZÁZNAMU – ONLINE PŘENOS') + '</p>';
   h += '</td></tr>';
