@@ -272,7 +272,7 @@ function checkPayments() {
 function parseBankAvizo_(text) {
   const t = String(text).replace(/\u00a0/g, ' ');
   let vs = '';
-  const mVs = t.match(/(?:variabiln[íi]\s*symbol|\bVS\b)\s*[:.]?\s*0*(\d{1,10})/i);
+  const mVs = t.match(/(?:variabiln[íi]\s*symbol|variable\s*symbol|\bVS\b)\s*[:.]?\s*0*(\d{1,10})/i);
   if (mVs) vs = mVs[1];
   let castka = 0;
   const mC = t.match(/(?:[čc][áa]stka|amount|p[řr][íi]choz[íi][^\n]{0,40}?)\s*[:.]?\s*\+?\s*([\d ]{1,12}(?:[.,]\d{1,2})?)\s*(?:CZK|K[čc])/i) ||
